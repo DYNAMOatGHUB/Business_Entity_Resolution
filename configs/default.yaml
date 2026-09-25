@@ -1,0 +1,44 @@
+seed: 42
+
+paths:
+  dataset_dir: "dataset"
+  train_dir: "dataset/train"
+  test_dir: "dataset/test"
+  artifacts_dir: "artifacts"
+  output_dir: "output"
+  reports_dir: "reports"
+  models_dir: "models"
+
+sample:
+  frac: 0.2
+  seed: 42
+
+mock:
+  k: 20
+
+train_countries: []
+
+blocking:
+  cap_k_per_s1: 50
+  b1_name_ngram_k: 20
+  b2_addr_ngram_k: 20
+  b3_rare_tokens_k: 20
+  b4_numeric_k: 20
+  b5_embed_ann_k: 25
+
+models:
+  embed_model_name: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+  cross_encoder_name: "intfloat/multilingual-e5-small"
+  lgbm_seeds: [42, 100, 2026]
+  n_folds: 5
+
+decide:
+  tau_gate: 0.50
+  tau_pair: 0.40
+  alpha_relative: 0.80
+  one_owner: true
+  unseen_country_margin: 0.05
+  tau_s2: null
+  tau_s3: null
+  alpha: 0.0
+  delta_unseen: 0.0
