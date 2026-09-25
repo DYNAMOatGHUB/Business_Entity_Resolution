@@ -140,3 +140,39 @@ def test_sample_records_keeps_all_candidates(cfg):
     sampled = load_artifact("records_norm", "train", sample=True, cfg=cfg)
     assert (sampled["source"] == "S1").sum() == 10
     assert {"S2-1", "S3-1"} <= set(sampled["entity_id"])
+
+
+def _scores(n_s1: int = 50) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "s1_id": [f"S1-{i}" for i in range(n_s1) for _ in range(2)],
+            "cand_id": [f"S2-{i}{j}" for i in range(n_s1) for j in range(2)],
+            "fold": 0,
+            "p_lgbm": [0.1, 0.9] * n_s1,
+            "p_final": [0.1, 0.9] * n_s1,
+        }
+    )
+
+
+def test_load_path_override_columns_and_filters(cfg, tmp_path):
+    path = tmp_path / "artifacts" / "scores_synth_train.parquet"
+    _scores().to_parquet(path)
+    df = load_artifact("scores", "train", cfg=cfg, path=path, columns=["s1_id", "p_final"], filters=[("p_final", ">=", 0.5)])
+    assert list(df.columns) == ["s1_id", "p_final"] and len(df) == 50 and (df["p_final"] == 0.9).all()
+    sampled = load_artifact("scores", "train", sample=True, cfg=cfg, path=path, filters=[("p_final", ">=", 0.5)])
+    assert len(sampled) == 10
+
+
+def test_column_check_uses_schema_even_when_loading_subset(cfg, tmp_path):
+    path = tmp_path / "artifacts" / "bad.parquet"
+    _scores().drop(columns=["fold"]).to_parquet(path)
+    with pytest.raises(ValueError, match=r"missing columns \['fold'\]"):
+        load_artifact("scores", "train", cfg=cfg, path=path, columns=["s1_id", "p_final"])
+
+
+def test_load_s1_meta_falls_back_to_raw(cfg):
+    from src.contracts import load_s1_meta
+
+    meta = load_s1_meta("train", cfg=cfg)
+    assert list(meta.columns) == ["entity_id", "country"] and len(meta) == 50
+    assert len(load_s1_meta("train", sample=True, cfg=cfg)) == 10

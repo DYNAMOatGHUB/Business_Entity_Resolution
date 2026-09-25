@@ -19,6 +19,7 @@ from functools import lru_cache
 from pathlib import Path
 
 import pandas as pd
+import pyarrow.parquet as pq
 
 from src.config import load_config, resolve_path
 from src.io_utils import sample_s1_ids
@@ -109,17 +110,11 @@ def artifact_path(name: str, split: str, cfg: dict | None = None) -> Path:
     return resolve_path(cfg["paths"]["artifacts_dir"]) / ARTIFACTS[name].format(split=split)
 
 
-def check_artifact(df: pd.DataFrame, name: str, split: str) -> None:
-    """Validate ``df`` against the contract of ``name``/``split``.
-
-    Raises ValueError listing every problem at once: missing required columns, extra columns
-    (not required, optional or carrying an allowed feature prefix) and duplicate key rows.
-    """
+def _column_problems(cols: list[str], name: str, split: str) -> list[str]:
+    """Missing required columns and extra columns (not required, optional or feature-prefixed)."""
     required = required_columns(name, split)
     allowed = set(required) | set(OPTIONAL_COLUMNS.get(name, []))
     prefixes = ALLOWED_PREFIXES.get(name, ())
-    cols = list(df.columns)
-
     problems = []
     missing = [c for c in required if c not in cols]
     if missing:
@@ -128,14 +123,34 @@ def check_artifact(df: pd.DataFrame, name: str, split: str) -> None:
     if extra:
         hint = f" (allowed prefixes: {list(prefixes)})" if prefixes else ""
         problems.append(f"unexpected columns {extra}{hint}")
+    return problems
+
+
+def _duplicate_problems(df: pd.DataFrame, name: str) -> list[str]:
+    """Duplicate key rows (skipped when the key columns are not all present)."""
     key = KEY_COLUMNS[name]
-    if all(k in cols for k in key):
-        n_dup = int(df.duplicated(key).sum())
-        if n_dup:
-            examples = df.loc[df.duplicated(key, keep=False), key].drop_duplicates().head(3).values.tolist()
-            problems.append(f"{n_dup} duplicate ({', '.join(key)}) rows, e.g. {examples}")
+    if not all(k in df.columns for k in key):
+        return []
+    dup = df.duplicated(key)
+    n_dup = int(dup.sum())
+    if not n_dup:
+        return []
+    examples = df.loc[df.duplicated(key, keep=False), key].drop_duplicates().head(3).values.tolist()
+    return [f"{n_dup} duplicate ({', '.join(key)}) rows, e.g. {examples}"]
+
+
+def _raise(problems: list[str], name: str, split: str) -> None:
     if problems:
         raise ValueError(f"{name}_{split} contract violated: " + "; ".join(problems))
+
+
+def check_artifact(df: pd.DataFrame, name: str, split: str) -> None:
+    """Validate ``df`` against the contract of ``name``/``split``.
+
+    Raises ValueError listing every problem at once: missing required columns, extra columns
+    (not required, optional or carrying an allowed feature prefix) and duplicate key rows.
+    """
+    _raise(_column_problems(list(df.columns), name, split) + _duplicate_problems(df, name), name, split)
 
 
 @lru_cache(maxsize=8)
@@ -166,20 +181,52 @@ def sample_frame(df: pd.DataFrame, name: str, keep_s1: frozenset[str] | set[str]
     return df.loc[mask].reset_index(drop=True)
 
 
-def load_artifact(name: str, split: str, sample: bool = False, cfg: dict | None = None) -> pd.DataFrame:
-    """Read an artifact, validate it with ``check_artifact`` and optionally apply the S1 sample.
+def load_artifact(
+    name: str,
+    split: str,
+    sample: bool = False,
+    cfg: dict | None = None,
+    path: str | Path | None = None,
+    columns: list[str] | None = None,
+    filters: list | None = None,
+) -> pd.DataFrame:
+    """Read an artifact, validate it against its contract and optionally apply the S1 sample.
 
+    ``path`` overrides the contract file name (e.g. a synthetic scores file) but the contract of
+    ``name`` still applies. Columns are validated from the parquet schema, so ``columns`` /
+    ``filters`` (pyarrow row filters, e.g. ``[("p_final", ">=", 0.2)]``) can load a slice of a
+    large file; duplicate keys are checked on the rows actually loaded.
     Raises FileNotFoundError naming the expected path and the stage that produces it.
     """
     cfg = cfg if cfg is not None else load_config()
-    path = artifact_path(name, split, cfg)
+    path = Path(path) if path is not None else artifact_path(name, split, cfg)
+    _check_name_split(name, split)
     if not path.exists():
         raise FileNotFoundError(f"{name} artifact not found at {path}; it is produced by {PRODUCED_BY[name]}")
-    df = pd.read_parquet(path)
-    check_artifact(df, name, split)
+    schema_cols = [c for c in pq.read_schema(path).names if not c.startswith("__index_level_")]
+    _raise(_column_problems(schema_cols, name, split), name, split)
+    df = pd.read_parquet(path, columns=columns, filters=filters)
+    _raise(_duplicate_problems(df, name), name, split)
     if sample:
         df = sample_frame(df, name, sampled_s1_ids(split, cfg))
     return df
+
+
+def load_s1_meta(split: str, sample: bool = False, cfg: dict | None = None) -> pd.DataFrame:
+    """S1 ``entity_id, country`` of a split: from records_norm, or the raw S1 TSV if Stage 0 has not run."""
+    cfg = cfg if cfg is not None else load_config()
+    try:
+        rec = load_artifact("records_norm", split, cfg=cfg, columns=["entity_id", "source", "country"])
+        meta = rec.loc[rec["source"] == "S1", ["entity_id", "country"]].reset_index(drop=True)
+    except FileNotFoundError as e:
+        print(f"[contracts] {e}\n[contracts] using raw {split}_source1.tsv for S1 countries")
+        s1_path = resolve_path(cfg["paths"]["dataset_dir"]) / split / f"{split}_source1.tsv"
+        meta = pd.read_csv(
+            s1_path, sep="\t", dtype=str, keep_default_na=False, quoting=csv.QUOTE_NONE, usecols=["entity_id", "country"]
+        )
+    if sample:
+        meta = meta[meta["entity_id"].isin(sampled_s1_ids(split, cfg))].reset_index(drop=True)
+    return meta
 
 
 def main() -> None:
