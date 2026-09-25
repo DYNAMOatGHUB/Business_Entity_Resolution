@@ -77,76 +77,85 @@ def _tfidf_knn_base(
 ) -> pd.DataFrame:
     """Fit TF-IDF on all records, then run per-country chunked kNN."""
 
-    # Fit on the full split (S1 + S2 + S3) — unsupervised, no labels.
-    all_texts = (
-        pd.concat([s1_df[text_col], cand_df[text_col]])
-        .fillna("")
-        .tolist()
-    )
-    vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4), dtype=np.float32)
-    vec.fit(all_texts)
-
-    # Build globally normalised matrices once — must be CSR for row slicing
-    s1_mat_global = vec.transform(s1_df[text_col].fillna("")).tocsr()
-    cand_mat_global = vec.transform(cand_df[text_col].fillna("")).tocsr()
-
-    # Sparse L2-normalise for cosine via dot product
-    # NOTE: .multiply() returns coo_matrix, so call .tocsr() again.
-    s1_norms = np.asarray(s1_mat_global.power(2).sum(axis=1)).ravel() ** 0.5
-    s1_norms[s1_norms == 0] = 1.0
-    s1_mat_global = s1_mat_global.multiply(1.0 / s1_norms[:, None]).tocsr()
-
-    cand_norms = np.asarray(cand_mat_global.power(2).sum(axis=1)).ravel() ** 0.5
-    cand_norms[cand_norms == 0] = 1.0
-    cand_mat_global = cand_mat_global.multiply(1.0 / cand_norms[:, None]).tocsr()
-
     s1_id_arr = s1_df["entity_id"].values
     cand_id_arr = cand_df["entity_id"].values
 
-    # Positional index maps for slicing
-    s1_pos = {eid: i for i, eid in enumerate(s1_id_arr)}
-    cand_pos = {eid: i for i, eid in enumerate(cand_id_arr)}
-
-    # Unique countries across both frames
     countries = pd.unique(pd.concat([s1_df["country"], cand_df["country"]]))
 
     all_results: list[tuple] = []
+    small_country_s1_indices = []
 
+    import gc
     for country in tqdm(countries, desc=f"kNN({prefix})"):
         s1_mask = s1_df["country"].values == country
         cand_mask = cand_df["country"].values == country
 
         n_group = s1_mask.sum() + cand_mask.sum()
         if n_group < 50:
-            # Fall back to global cand pool for tiny-country S1 entities
-            s1_rows = np.where(s1_mask)[0]
-            if len(s1_rows) == 0:
-                continue
-            all_results.extend(
-                _sparse_top_k(
-                    s1_mat_global[s1_rows],
-                    cand_mat_global,
-                    s1_id_arr[s1_rows],
-                    cand_id_arr,
-                    k,
-                    prefix,
-                )
+            # Accumulate tiny-country S1 entities to fall back to global cand pool later
+            small_country_s1_indices.extend(np.where(s1_mask)[0].tolist())
+            continue
+            
+        s1_rows = np.where(s1_mask)[0]
+        cand_rows = np.where(cand_mask)[0]
+        if len(s1_rows) == 0 or len(cand_rows) == 0:
+            continue
+            
+        # Localize DataFrames
+        local_s1_df = s1_df.iloc[s1_rows]
+        local_cand_df = cand_df.iloc[cand_rows]
+        
+        # Localize Vectorization
+        vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4), dtype=np.float32)
+        fit_texts = pd.concat([local_s1_df[text_col], local_cand_df[text_col]]).fillna("").tolist()
+        vec.fit(fit_texts)
+        
+        s1_mat_local = vec.transform(local_s1_df[text_col].fillna("")).tocsr()
+        cand_mat_local = vec.transform(local_cand_df[text_col].fillna("")).tocsr()
+
+        all_results.extend(
+            _sparse_top_k(
+                s1_mat_local,
+                cand_mat_local,
+                s1_id_arr[s1_rows],
+                cand_id_arr[cand_rows],
+                k,
+                prefix,
             )
+        )
+        
+        # Flush RAM
+        del vec, s1_mat_local, cand_mat_local, local_s1_df, local_cand_df, fit_texts
+        gc.collect()
+
+    # Process all tiny countries against the global candidate pool in ONE pass (no slicing of cand_mat_global)
+    if small_country_s1_indices:
+        local_s1_df = s1_df.iloc[small_country_s1_indices]
+        
+        all_texts_df = pd.concat([local_s1_df[text_col], cand_df[text_col]]).fillna("")
+        if len(all_texts_df) > 2_000_000:
+            fit_texts = all_texts_df.sample(n=2_000_000, random_state=42).tolist()
         else:
-            s1_rows = np.where(s1_mask)[0]
-            cand_rows = np.where(cand_mask)[0]
-            if len(s1_rows) == 0 or len(cand_rows) == 0:
-                continue
-            all_results.extend(
-                _sparse_top_k(
-                    s1_mat_global[s1_rows],
-                    cand_mat_global[cand_rows],
-                    s1_id_arr[s1_rows],
-                    cand_id_arr[cand_rows],
-                    k,
-                    prefix,
-                )
+            fit_texts = all_texts_df.tolist()
+            
+        vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4), dtype=np.float32)
+        vec.fit(fit_texts)
+        
+        s1_mat_global = vec.transform(local_s1_df[text_col].fillna("")).tocsr()
+        cand_mat_global = vec.transform(cand_df[text_col].fillna("")).tocsr()
+        
+        all_results.extend(
+            _sparse_top_k(
+                s1_mat_global,
+                cand_mat_global,
+                local_s1_df["entity_id"].values,
+                cand_id_arr,
+                k,
+                prefix,
             )
+        )
+        del vec, s1_mat_global, cand_mat_global, all_texts_df, fit_texts, local_s1_df
+        gc.collect()
 
     if not all_results:
         return pd.DataFrame(
