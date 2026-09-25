@@ -29,7 +29,7 @@
 
 - **Blocking keys used:** TF-IDF character-level kNN (chunked safe sparse dot product with country-grouping fallback) and Dense Embeddings via multi-lingual sentence-transformers with batched GPU acceleration.
 - **Candidate pairs generated:** [INSERT FINAL PAIR COUNT HERE]
-- **How you ensured true matches were not lost:** We implemented a dual blocking approach combining sparse lexical matching (names and addresses via TF-IDF character kNN) with dense semantic matching (GPU-accelerated exact `top-k` cdist cross-joins). The `blend_rank` logic in `union.py` then aggregates the hits. To protect the singleton F_0.5 score, we strictly penalize and drop zero-signal pairs, thereby reducing false merges while retaining high-confidence true matches.
+- **How you ensured true matches were not lost:** We implemented a dual blocking approach combining sparse lexical matching (names and addresses via TF-IDF character kNN) with dense semantic matching (GPU-accelerated exact `top-k` cdist cross-joins). The `blend_rank` logic in `union.py` then aggregates the hits. Zero-signal pairs are not dropped at blocking: `union.py` keeps them (the only pruning is the per-S1 cap on candidates ranked by `blend_rank`) and flags them with `low_confidence=True` (best blocker similarity < 0.05 and at most one blocker hit), leaving the match/no-match decision to the scoring model and decision layer.
 
 ---
 
